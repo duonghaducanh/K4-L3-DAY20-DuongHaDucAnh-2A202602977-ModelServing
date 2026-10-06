@@ -5,59 +5,67 @@ CPU: **8 physical · 16 logical** cores · `ngl=0` · metric `tg128`
 
 | threads (-t) | tg128 (tok/s) | vs best |
 |:--|--:|--:|
-| 1 | 12.3 | 61% |
-| 4 | 20.2 | 100% |
-| 8 | 12.0 | 60% |
-| 16 | 8.5 | 42% |
-| 32 | 4.7 | 23% |
+| 1 | 18.3 | 33% |
+| 4 | 46.6 | 85% |
+| 8 | 55.2 | 100% |
+| 16 | 32.0 | 58% |
+| 32 | 19.8 | 36% |
 
-**Best**: `-t 4` at 20.2 tok/s
-**Slowest tested**: `-t 32` at 4.7 tok/s (4.34x spread)
-**Against the physical-core default** (`-t 8`, 12.0 tok/s): 1.68x
+**Best**: `-t 8` at 55.2 tok/s
+**Slowest tested**: `-t 1` at 18.3 tok/s (3.01x spread)
+**Against the physical-core default** (`-t 8`, 55.2 tok/s): 1.00x
 
 Use this in your run:
 
 ```bash
-LAB_N_THREADS=4 make bench
+LAB_N_THREADS=8 make bench
 ```
 
 ## Your explanation
 
-**The knee sits at `-t 4` — *below* this CPU's 8 physical cores — and the curve
-falls off a cliff above it.** From 20.2 tok/s at `-t 4`, throughput drops to 12.0 at
-`-t 8` (the physical-core default), 8.5 at `-t 16`, and 4.7 at `-t 32` — a 4.34x
-spread, worst case at the *most* threads. That is the opposite of the deck's
-expected shape (climb to physical cores, then flatten).
+**The knee sits exactly at `-t 8` — this CPU's physical core count — and the curve
+falls off past it.** Decode climbs 18.3 → 46.6 → **55.2 tok/s** as threads go 1 → 4 → 8,
+then drops to 32.0 at `-t 16` (hyperthreads) and 19.8 at `-t 32` (2× oversubscription).
+That is the deck's expected shape: climb to physical cores, then flatten/fall. The
+spread is 3.01×, and the worst point is the *most* threads.
 
-First I checked the obvious explanation for a 45 W laptop part: **thermal/power
-throttling** under 8-32 busy threads. To separate "the chip is throttling" from
-"this stage doesn't scale", I re-ran the identical sweep on the **prefill** metric
-(`pp512`, same model, same `ngl=0`):
+**Why the knee is at 8 and why hyperthreads hurt.** Decode does ~1 token of work per
+pass over the whole weight set, so its arithmetic intensity is ≈1 FLOP/byte — it is
+bound by **memory bandwidth/latency, not FLOPs**. Going 1 → 8 threads adds real
+memory-level parallelism: eight cores can have eight independent cache-miss streams
+in flight, so bandwidth utilization climbs toward saturation. Past 8 there is nothing
+left to parallelize *in the memory subsystem*: the 8 physical cores already keep the
+channels busy, so the 8 hyperthreads (16 logical) add no new memory requests — they
+just add work to the per-step synchronization barrier that every thread must clear.
+More sync cost, same useful work → throughput falls. `-t 32` doubles the contention
+again, hence 19.8.
+
+**The confirming cross-check: prefill has the opposite knee.** I re-ran the identical
+sweep on the prefill metric `pp512` (same model, same `ngl=0`), and it *keeps climbing
+past 8*, peaking at `-t 16`:
 
 | threads | 1 | 4 | 8 | 16 | 32 |
 |:--|--:|--:|--:|--:|--:|
-| `tg128` decode (tok/s) | 12.3 | **20.2** | 12.0 | 8.5 | 4.7 |
-| `pp512` prefill (tok/s) | 63.9 | 165.7 | 228.3 | **237.9** | 231.7 |
+| `tg128` decode (tok/s) | 18.3 | 46.6 | **55.2** | 32.0 | 19.8 |
+| `pp512` prefill (tok/s) | 63.8 | 166.1 | 228.8 | **254.5** | 238.0 |
 
-The two stages have **opposite shapes**. Prefill *keeps climbing* to ~16 threads
-and plateaus — it never collapses. If the CPU were throttling under thread load,
-prefill would collapse too. It doesn't. So the decode drop is **not** thermal; it
-is about what each stage is bound by:
+Two stages, two knees. Prefill is **compute-bound** — each pass does ~512 tokens of
+work over the weights (high arithmetic intensity), so every thread adds real FLOPs and
+even hyperthreads help by filling pipeline bubbles; it peaks at the *logical* core
+count (16). Decode is **bandwidth-bound**, so it saturates at the *physical* count (8)
+and hyperthreads only add barrier cost. The metric you tune for therefore changes the
+answer: `-t 8` for decode-heavy serving (what this lab runs), `-t 16` for prefill-heavy
+long-context ingestion.
 
-- **Prefill is compute-bound.** It does ~512 tokens of work per pass over the
-  weights (high arithmetic intensity), so every extra thread adds real FLOPs. It
-  scales to ~physical cores, then flattens.
-- **Decode is not compute-bound.** It does ~1 token of work per pass over the same
-  weights (arithmetic intensity ≈ 1 FLOP/byte), so it is limited by memory
-  latency/bandwidth and by per-step synchronization, not by FLOPs. Four threads
-  already saturate what this laptop's memory subsystem can feed a 0.5 GB model;
-  past that, every decode step still pays a barrier across *all* threads, so the
-  synchronization cost grows while the useful work does not. Throughput falls.
-
-Practical takeaway, and it is metric-dependent: **`-t 4` for decode-heavy serving**
-(what this lab serves — `make serve` uses `-t 4`), and `-t 8…16` if you cared about
-prefill-heavy work such as long-context RAG ingestion. The default `-t 8` is a
-compromise that is best at neither. (Single runs on a laptop — absolute values
-drift a few percent run to run, but both curve *shapes* reproduced on every repeat.)
+**Reproducibility note (honest correction).** An earlier version of this report claimed
+the knee was at `-t 4` with values ~4× lower (12.0 at `-t 8`). That run did not
+reproduce: three repeated `llama-bench` runs on a quiet machine give 47.2 ± 0.9 tok/s
+at `-t 4` and 53.9 ± 0.4 at `-t 8`, matching the table above, while the same sweep on
+`pp512` reproduced closely both times. The old numbers were taken under CPU
+contention/power limiting, which flattened the curve and moved the apparent knee. The
+table and explanation above are the reproducible measurement; the earlier claim is
+retracted. (Single runs on a laptop drift a few percent run to run, but the curve
+*shape* — peak at physical cores for decode, at logical cores for prefill — reproduced
+on every repeat.)
 
 Supporting artifact: `benchmarks/01-tuning-pp512.md`.

@@ -5,33 +5,33 @@ retrieval backend: **keyword overlap** · 3 queries
 
 | Query | Contexts retrieved | embed (ms) | retrieve (ms) | llm (ms) | total (ms) |
 |:--|--:|--:|--:|--:|--:|
-| Why is goodput more useful than raw throughp... | goodput, paged, radix | 0.0 | 0.1 | 11193.0 | 11193.2 |
-| What problem does PagedAttention actually so... | paged, radix, disagg | 0.0 | 0.1 | 5928.9 | 5929.0 |
-| When does splitting prefill and decode help?... | disagg, radix, batching | 0.0 | 0.1 | 7578.2 | 7578.4 |
+| Why is goodput more useful than raw throughp... | goodput, paged, radix | 0.0 | 0.0 | 4766.0 | 4766.0 |
+| What problem does PagedAttention actually so... | paged, radix, disagg | 0.0 | 0.0 | 3633.1 | 3633.2 |
+| When does splitting prefill and decode help?... | disagg, radix, batching | 0.0 | 0.0 | 4157.7 | 4157.8 |
 
-Mean per stage (ms): embed **0.0** · retrieve **0.1** ·
-llm **8233.4** · total **8233.5**
+Mean per stage (ms): embed **0.0** · retrieve **0.0** ·
+llm **4185.6** · total **4185.7**
 Dominant stage: **llm** (100% of total)
 
 ## Answers returned
 
 **Why is goodput more useful than raw throughput?**
 
-> Based on the context provided, **Goodput** is more useful than raw throughput because it focuses on the specific metrics that define a system's reliability and performance under real-world conditions.
+> Goodput is more useful than raw throughput because it **only counts requests that met the Target Time-to-Fullness (TTFT) and Target Time-to-Poll (TPOT) targets**, while ignoring requests that do not meet these targets.
 
-According to the text:
-*   **Goodput** counts requests per second that met the **TTFT** (Total Throughput) and **TPOT** (Total Throughput with Overhead) targets.
-*   It explicitly states that **thro
+In contrast, raw throughput often suffers from "saturation," where the system becomes so full that it ignores SLOs (Service Level Objectives) and only counts requests that are acti
 
 **What problem does PagedAttention actually solve?**
 
-> PagedAttention solves the problem of **internal fragmentation in GPU memory** caused by storing key-value pairs in non-contiguous pages. By organizing the KV cache into separate pages, it removes the wasted space that would otherwise be consumed by the internal fragmentation of contiguous memory blocks.
+> PagedAttention solves the problem of **internal fragmentation in GPU memory** caused by storing the key-value cache (KV cache) in non-contiguous pages.
+
+By doing so, it removes the wasted space that would otherwise be occupied by the internal fragmentation of contiguous memory blocks.
 
 **When does splitting prefill and decode help?**
 
-> Splitting prefill and decode helps when **prefill is compute-bound and decode is memory-bound**.
+> Based on the context provided, splitting prefill and decode helps when **prefill is compute-bound and decode is memory-bandwidth-bound**.
 
-This occurs because the context explicitly states that prefilling the model requires significant computation (often on GPU cores), while decoding requires significant memory bandwidth. By splitting these operations into separate pools (prefill and decode), the system can utilize different hardware res
+The context explicitly states that prefill is compute-bound and decode is memory-bandwidth-bound. By splitting them, the system allows the engine to skip prefill entirely when a shared prefix exists (as in RadixAttention), thereby improving performance.
 
 
 ## Which N16-N19 pieces are real
@@ -44,21 +44,19 @@ This occurs because the context explicitly states that prefilling the model requ
 | N19 Vector + features | **stub** — retrieval backend is `keyword overlap` (token scoring), not a vector index; `embed = 0.0 ms` because no embedding server ran |
 | N20 Serving | **real** — `llama-server` (`b10488`), OpenAI-compatible, continuous batching |
 
-So of N16–N19, **none are real**; only N20 is. The pipeline proves the serving
-endpoint end-to-end, but the retrieval half is a stub — the answers come from the
-model plus six toy documents, not from an embedded/vector-retrieved corpus.
+**Is the dominant stage what I expected?** Yes, and more extreme than expected: the LLM
+stage is **4185.6 ms of a 4185.7 ms total — 100%** — while embed (0.0) + retrieve (0.0)
+together are under 0.1 ms. The retrieval half is a pure stub, so of course it costs
+nothing. What *was* worth seeing: the server's own timings show the split *inside* the
+LLM stage — e.g. query 1 is **prefill 151 tok / 456 ms** + **decode 116 tok / 2070 ms**,
+so decode dominates even at a ~150-token prompt, and the total (4.8 s) tracks the
+generated-token count (200 `max_tokens`) far more than the prompt.
 
-**Is the dominant stage what I expected?** Yes, but the margin is starker than I
-expected. `llm` is **8233.4 of 8233.5 ms = 100%** of total; embed (0.0 ms) and
-retrieve (0.1 ms) are rounding error — three orders of magnitude below generation.
-I expected the LLM to dominate, but I did not expect retrieval to be *free*: on a
-real vector backend with embeddings, embed + retrieve would move from ~0.1 ms to
-tens of ms — still small next to 8.2 s of CPU decode.
-
-**To halve this pipeline's latency I would attack `llm`, and only `llm`.** Shaving
-retrieval by 100% saves 0.1 ms out of 8233.5 ms — invisible. The levers that
-actually move `llm`: (1) **GPU offload** — this host has an RTX 3070 Laptop sitting
-idle at `ngl=0`, the single biggest available win; (2) **cap `max_tokens`** — the two
-long answers alone cost ~9-11 s; (3) a shorter prompt/context to cut prefill. I
-would try (1) first, because it attacks the 100% stage at its root instead of
-trimming around it.
+**If I had to halve the latency, I would attack the LLM stage — specifically the decode
+side.** Nothing else is on the table: fixing retrieval cannot help a stage that costs
+0.1 ms. Within the LLM stage the lever is `max_tokens` / output length (decode is
+~18 ms/token here, so the 200-token cap is ~3.6 s of the 4.2 s), then GPU offload — the
+RTX 3070 is idle at `ngl=0` because the prebuilt CUDA backend fails to load on this
+machine (missing CUDA runtime DLLs), which is the single largest untapped speedup. Short
+of that, shortening retrieved context does little here because the prompts are already
+tiny (~113–151 tokens of prefill); the cost is generation, not context.

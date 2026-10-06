@@ -71,10 +71,12 @@ def is_committed(path: pathlib.Path) -> bool | None:
     if TRACKED is None:
         return None
     try:
-        rel = str(path.resolve().relative_to(labkit.repo_root()))
+        rel = path.resolve().relative_to(pathlib.Path(labkit.repo_root()).resolve())
     except ValueError:
         return None
-    return rel in TRACKED
+    # git ls-files always prints POSIX separators, so compare as POSIX: on Windows
+    # str(Path) would be "models\active.json" and never match "models/active.json".
+    return rel.as_posix() in TRACKED
 
 
 class Report:

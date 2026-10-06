@@ -1,41 +1,44 @@
 # 01 - Measure: latency baseline
 
 Model `Qwen3.5 0.8B` · host `Windows-AMD64` · llama.cpp `b10488`
-Settings: `threads=4` `ngl=0` `ctx=2048`
+Settings: `threads=8` `ngl=0` `ctx=2048`
 `max_tokens=64` · warm-up discarded
 Completed requests: `Q4_K_M` 10/10 · `UD-Q2_K_XL` 10/10
 
 | Quantization | Size (GB) | Load (ms) | TTFT P50/P95 (ms) | TPOT P50/P95 (ms) | E2E P50/P95/P99 (ms) | Decode (tok/s) |
 |:--|--:|--:|--:|--:|--:|--:|
-| Q4_K_M | 0.50 | 3627 | 794 / 1476 | 64.0 / 81.2 | 4636 / 5854 / 5854 | 15.6 |
-| UD-Q2_K_XL | 0.39 | 4327 | 1155 / 1705 | 85.3 / 152.0 | 6531 / 10952 / 10952 | 11.7 |
+| Q4_K_M | 0.50 | 2610 | 336 / 381 | 20.5 / 24.1 | 1549 / 1852 / 1852 | 48.8 |
+| UD-Q2_K_XL | 0.39 | 1440 | 403 / 433 | 18.7 / 24.4 | 1582 / 1730 / 1730 | 53.4 |
 
 - **TTFT** = prefill. Short prompts keep it small; long-context RAG is where it explodes.
 - **TPOT** = per-output-token decode cost, bounded by memory bandwidth. `decode tok/s = 1000 / TPOT_p50`.
-- `UD-Q2_K_XL` decodes **1.33x SLOWER** than `Q4_K_M` here, despite being 0.11 GB smaller. That is a real result, not a mistake: fewer bits only buys speed when decode is limited by memory bandwidth. On a machine that is compute-limited instead — few cores, no GPU offload — the extra dequantization work of a heavily-quantized format can cost more than the bytes it saves. Say which case yours is.
+- `UD-Q2_K_XL` decodes **1.09x faster** than `Q4_K_M` here, for 0.11 GB less on disk.
 
 ## Your observation
 
-**No — the 2-bit model is not worth it on this machine.** `UD-Q2_K_XL` is 0.11 GB
-(22%) smaller, but it is **1.33x slower to decode** (11.7 vs 15.6 tok/s), **1.45x
-slower to first token** (TTFT P50 1155 vs 794 ms) and **1.41x slower end-to-end**
-(E2E P50 6531 vs 4636 ms). Size fell 22%; speed fell 33%. That trade is strictly bad.
+**On this machine the smaller quantization is *not* worth it — the speed is a tie and
+the quality is slightly worse.** This run shows Q4_K_M at 48.8 tok/s and UD-Q2_K_XL at
+53.4 tok/s, i.e. Q2 *faster* by 1.09× — but that direction does not survive repetition.
+A 5-rep `llama-bench` comparison gives **52.05 ± 0.87 (Q4) vs 52.40 ± 2.50 (Q2)**:
+statistically equal. The two formats are within run-to-run noise of each other in both
+directions, so the honest reading is **no speed difference**. The 2-bit model is 22%
+smaller on disk and buys **no** decode speedup, while giving up quality.
 
-Why: this host runs `ngl=0` — **CPU-only, compute-limited**. Decode speed is set by
-how fast the cores can dequantize-and-multiply each weight, not by how few bytes
-cross the bus. A 2-bit format packs more values per byte, but unpacking it costs
-more integer work per weight than the 4-bit K-quants, and there is no GPU to hide
-that behind. The 0.11 GB saved buys nothing when bandwidth was never the wall.
+**Which case is my machine?** The header says it: `ngl=0` — CPU-only, no GPU offload.
+Fewer bits only buy speed when decode is limited by *memory bandwidth* (the bytes you
+must stream per token). Here decode runs at ~52 tok/s either way, which tells me the
+bottleneck is not the byte count — it is the per-token compute/dequantization work, and
+a 2-bit format needs *more* dequant work per weight, not less. On a bandwidth-bound
+machine (GPU offload, or a much larger model where weights dominate) the 2-bit version
+would pull ahead; on this compute-limited laptop it does not.
 
-I also ran the same prompt on both (`--seed 42`, reasoning off):
+**Quality check (my own, `--temp 0`, 7 prompts — arithmetic, JSON extraction,
+instruction-following, a fact, a syllogism):** Q4_K_M scored **5/7**, UD-Q2_K_XL scored
+**4/7**. The decisive one: asked "What is the capital of France? One word.", Q4 answered
+`Paris` and Q2 answered `Bun.` — a confident non-answer. Both failed the arithmetic and
+syllogism prompts (this 0.8B model is simply weak there), so the *marginal* damage from
+2-bit is one extra confidently-wrong answer out of seven.
 
-- **Q4_K_M** — coherent: *"Continuous batching processes large datasets in parallel,
-  allowing the GPU to simultaneously process individual batches…"*
-- **UD-Q2_K_XL** — degraded and self-contradictory: *"…reduces the load on GPU
-  memory by grouping instances of the same data with a shared state buffer…"* and
-  then *"However, continuous batching improves GPU utilization because it reduces
-  the number of data points sent to GPU memory…"* — two sentences that contradict
-  each other, and neither describes what continuous batching does.
-
-Slower **and** worse. Recommendation: keep `Q4_K_M` as primary; revisit 2-bit only
-if RAM is the hard constraint — and it is not (15.7 GB total).
+**Verdict:** deploy **Q4_K_M**. The 22% disk saving of UD-Q2_K_XL buys nothing on this
+CPU-only box and costs measurable quality. Size and speed are measurable and here they
+say "no"; usefulness — my call — agrees.
