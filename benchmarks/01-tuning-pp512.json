@@ -1,0 +1,33 @@
+{
+  "metric": "pp512",
+  "cores": {
+    "physical": 8,
+    "logical": 16
+  },
+  "rows": [
+    {
+      "threads": 1,
+      "tok_s": 63.87
+    },
+    {
+      "threads": 4,
+      "tok_s": 165.72
+    },
+    {
+      "threads": 8,
+      "tok_s": 228.3
+    },
+    {
+      "threads": 16,
+      "tok_s": 237.95
+    },
+    {
+      "threads": 32,
+      "tok_s": 231.67
+    }
+  ],
+  "best": {
+    "threads": 16,
+    "tok_s": 237.95
+  }
+}
